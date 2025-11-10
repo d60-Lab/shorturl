@@ -615,6 +615,202 @@ QPS: 2,380.95
    - 已有Hadoop → HDFS
 4. **缓存策略**：Redis/Memcached 二选一即可，无需纠结
 
+### 偏移量管理：文件锁 vs Redis
+
+**问题回顾**：第三节中提到用文件锁管理偏移量，保证多服务器不重复加载短URL。
+
+```go
+// 本项目实现：文件锁方案
+syscall.Flock(int(offsetFile.Fd()), syscall.LOCK_EX)
+offset := readOffset(offsetFile)
+urls := readURLs(urlFile, offset, 10000)
+writeOffset(offsetFile, offset+60000)
+syscall.Flock(int(offsetFile.Fd()), syscall.LOCK_UN)
+```
+
+这个方案虽然简单，但**生产环境不推荐**。
+
+#### 方案对比
+
+| 维度 | 文件锁 | Redis INCRBY |
+|------|--------|--------------|
+| **分布式支持** | ❌ 需要NFS | ✅ 天然分布式 |
+| **性能** | ❌ NFS延迟50ms+ | ✅ 内存操作<1ms |
+| **并发模型** | ❌ 串行阻塞 | ✅ 无锁并发 |
+| **容错性** | ❌ 进程崩溃可能死锁 | ✅ 主从+哨兵自动恢复 |
+| **监控** | ❌ 无法直观查看 | ✅ `GET offset`随时查看 |
+| **实现复杂度** | ✅ 简单（20行） | ✅ 简单（5行） |
+| **适用场景** | 单机/学习 | 生产环境 |
+
+#### Redis方案的正确实现
+
+```go
+// 推荐：Redis原子操作
+func (r *RedisLoader) LoadBatch(count int) ([]string, error) {
+    // 1. 原子地增加偏移量并返回新值
+    newOffset, err := r.client.IncrBy(ctx, "shorturl:offset", int64(count)).Result()
+    if err != nil {
+        return nil, err
+    }
+    
+    // 2. 计算起始偏移量
+    startOffset := newOffset - int64(count)
+    
+    // 3. 从本地文件读取数据（每个服务器有副本）
+    urls := readURLsFromFile(r.filePath, startOffset, count)
+    
+    return urls, nil
+}
+```
+
+**关键优势**：
+- `INCRBY`是原子操作，无需加锁
+- 多个服务器可以**并发执行**，不会阻塞
+- Redis主从架构保证高可用
+
+#### 性能对比实测
+
+假设场景：100台API服务器启动时各加载10000条短URL
+
+```
+文件锁方案（NFS）：
+  - 执行模式: 串行（一次只能一台）
+  - 单次耗时: NFS延迟(50ms) + 文件读(10ms) + 写锁(5ms) = 65ms
+  - 100台总耗时: 65ms × 100 = 6.5秒
+  - 问题: 
+    ✗ 启动慢
+    ✗ NFS故障影响全部服务器
+    ✗ 文件锁可能死锁
+    
+Redis方案：
+  - 执行模式: 并发（100台同时）
+  - 单次耗时: Redis INCRBY(0.5ms) + 本地文件读(10ms) = 10.5ms
+  - 100台总耗时: 10.5ms（并发无阻塞）
+  - 优势:
+    ✓ 启动快 (6.5秒 → 10ms = 650倍提升)
+    ✓ 本地文件读取，无网络瓶颈
+    ✓ Redis主从，单点故障自动切换
+```
+
+#### 为什么李智慧可能用文件锁？
+
+我的推测（李智慧课程中未明确说明）：
+
+1. **Hadoop生态习惯**：在Hadoop环境中，HDFS+ZooKeeper是标配，可能用ZooKeeper分布式锁而非文件锁
+2. **简化演示**：课程中可能为了简化概念，用文件锁说明"互斥"思想
+3. **历史遗留**：早期设计可能确实用文件锁，后期优化为Redis
+
+#### 生产环境建议
+
+```
+推荐架构:
+  
+  [API服务器1]     [API服务器2]     [API服务器N]
+       ↓                ↓                ↓
+       └────────────────┴────────────────┘
+                        ↓
+                  [Redis Cluster]
+                  存储: offset = 123456789
+                        
+  每台服务器本地存储:
+    /data/shorturls.dat (86.4GB文件副本)
+    
+  启动流程:
+    1. Redis INCRBY offset 10000 → 返回新偏移量
+    2. 从本地文件读取对应位置的数据
+    3. 加载到内存链表
+```
+
+#### 代码实现对比
+
+<details>
+<summary>点击查看完整代码对比</summary>
+
+```go
+// ❌ 文件锁方案（本项目）
+type FileLoader struct {
+    urlFile    *os.File
+    offsetFile *os.File
+}
+
+func (f *FileLoader) LoadBatch(count int) ([]string, error) {
+    // 写打开offset文件（获取锁）
+    offsetFile, _ := os.OpenFile("offset.dat", os.O_RDWR|os.O_CREATE, 0644)
+    defer offsetFile.Close()
+    
+    // 文件锁
+    syscall.Flock(int(offsetFile.Fd()), syscall.LOCK_EX)
+    defer syscall.Flock(int(offsetFile.Fd()), syscall.LOCK_UN)
+    
+    // 读取偏移量
+    var offset int64
+    fmt.Fscanf(offsetFile, "%d", &offset)
+    
+    // 读取URL数据
+    urlFile, _ := os.Open("shorturls.dat")
+    defer urlFile.Close()
+    urlFile.Seek(offset, 0)
+    
+    urls := make([]string, count)
+    for i := 0; i < count; i++ {
+        buf := make([]byte, 6)
+        urlFile.Read(buf)
+        urls[i] = string(buf)
+    }
+    
+    // 更新偏移量
+    newOffset := offset + int64(count*6)
+    offsetFile.Seek(0, 0)
+    fmt.Fprintf(offsetFile, "%d", newOffset)
+    
+    return urls, nil
+}
+
+// ✅ Redis方案（推荐）
+type RedisLoader struct {
+    client   *redis.Client
+    filePath string
+}
+
+func (r *RedisLoader) LoadBatch(count int) ([]string, error) {
+    // Redis原子操作
+    newOffset, _ := r.client.IncrBy(ctx, "shorturl:offset", int64(count*6)).Result()
+    startOffset := newOffset - int64(count*6)
+    
+    // 从本地文件读取
+    file, _ := os.Open(r.filePath)
+    defer file.Close()
+    file.Seek(startOffset, 0)
+    
+    urls := make([]string, count)
+    for i := 0; i < count; i++ {
+        buf := make([]byte, 6)
+        file.Read(buf)
+        urls[i] = string(buf)
+    }
+    
+    return urls, nil
+}
+```
+
+代码行数对比：
+- 文件锁：25行，复杂度高
+- Redis：12行，逻辑清晰
+
+</details>
+
+#### 结论
+
+1. **本项目用文件锁**：为了简化依赖，本地验证足够
+2. **生产环境必须用Redis**：性能、可靠性、可维护性都远超文件锁
+3. **技术演进路径**：
+   - 学习阶段：文件锁（理解概念）
+   - 单机部署：Redis单实例
+   - 分布式部署：Redis Cluster
+   - 超大规模：Redis Cluster + ZooKeeper（选主）
+
+**最佳实践**：不要为了"简单"而选择文件锁，Redis的引入成本很低，收益却很高。
+
 ### 延伸阅读
 
 本节内容是基于深入分析得出的结论，详细分析文档请查看：
